@@ -1,0 +1,204 @@
+#!/bin/bash
+set -o pipefail
+
+REV=w4
+LOG=/home/chronos/user/MyFiles/Downloads/wifi-w4.log
+MARK=/home/chronos/user/MyFiles/Downloads/.wifi-w4-stage1-done
+mkdir -p /home/chronos/user/MyFiles/Downloads 2>/dev/null || true
+exec > >(tee -a "$LOG") 2>&1
+
+echo
+echo "=== $REV A6210 ChromeOS module-locking installer ==="
+echo "Log: $LOG"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: Run from VT-2 root."
+  exit 1
+fi
+
+EXPECTED="5.15.213-24755-gd8271724728f"
+if [ "$(uname -r)" != "$EXPECTED" ]; then
+  echo "ERROR: Kernel mismatch."
+  echo "Expected: $EXPECTED"
+  echo "Actual:   $(uname -r)"
+  exit 2
+fi
+
+WORK=/usr/local/a6210
+MOD="$WORK/modules"
+
+if [ ! -f "$MARK" ]; then
+  echo
+  echo "[STAGE 1] Disable ChromeOS rootfs verification"
+  echo
+  echo "This is required because ChromeOS LoadPin blocked our external driver."
+  echo "It makes the root filesystem writable and reduces verified-boot protection."
+  echo "ChromeOS updates may behave differently, and returning to normal verified"
+  echo "mode later may require recovery."
+  echo
+  printf 'Type YES to continue: '
+  read -r ANSWER
+  if [ "$ANSWER" != "YES" ]; then
+    echo "No changes made."
+    exit 0
+  fi
+
+  ROOTDEV="$(rootdev -s 2>/dev/null)"
+  RPART="$(echo "$ROOTDEV" | sed -n 's/.*[^0-9]\([0-9][0-9]*\)$/\1/p')"
+  if [ -z "$RPART" ]; then
+    echo "ERROR: Could not determine active root partition from: $ROOTDEV"
+    exit 3
+  fi
+  KPART=$((RPART - 1))
+
+  echo "Active rootfs: $ROOTDEV"
+  echo "Active kernel partition: $KPART"
+
+  if command -v crossystem >/dev/null 2>&1; then
+    SIGNED_ONLY="$(crossystem dev_boot_signed_only 2>/dev/null || echo unknown)"
+    echo "dev_boot_signed_only: $SIGNED_ONLY"
+    if [ "$SIGNED_ONLY" = "1" ]; then
+      echo "Allowing developer-signed kernel images."
+      crossystem dev_boot_signed_only=0 || {
+        echo "ERROR: Could not set dev_boot_signed_only=0"
+        exit 4
+      }
+    fi
+  fi
+
+  CMD=/usr/share/vboot/bin/make_dev_ssd.sh
+  if [ ! -x "$CMD" ]; then
+    echo "ERROR: $CMD is missing."
+    exit 5
+  fi
+
+  echo
+  echo "Disabling rootfs verification on the active kernel partition..."
+  "$CMD" --remove_rootfs_verification --partitions "$KPART"
+  RC=$?
+  if [ $RC -ne 0 ]; then
+    echo "ERROR: make_dev_ssd.sh failed with exit code $RC"
+    exit 6
+  fi
+
+  touch "$MARK"
+  sync
+  echo
+  echo "Stage 1 completed successfully."
+  echo "The Chromebook must reboot before module locking can be disabled."
+  echo "After reboot, return to VT-2 root and run the SAME command again:"
+  echo "  bash w4.txt"
+  echo
+  echo "Rebooting in 5 seconds..."
+  sleep 5
+  reboot
+  exit 0
+fi
+
+echo
+echo "[STAGE 2] Disable module locking and load the A6210 driver"
+
+SYSCTL=/proc/sys/kernel/chromiumos/module_locking
+if [ ! -e "$SYSCTL" ]; then
+  echo "ERROR: $SYSCTL is not exposed."
+  echo "Rootfs verification may still be active."
+  echo "Kernel cmdline:"
+  cat /proc/cmdline
+  exit 7
+fi
+
+echo "module_locking before: $(cat "$SYSCTL" 2>/dev/null)"
+echo 0 > "$SYSCTL" || {
+  echo "ERROR: Could not disable module locking."
+  exit 8
+}
+echo "module_locking after:  $(cat "$SYSCTL" 2>/dev/null)"
+
+if [ ! -d "$MOD" ]; then
+  echo "ERROR: Compiled A6210 bundle is missing at $MOD"
+  echo "Run w3 once with Internet to download it, then rerun w4."
+  exit 9
+fi
+
+echo
+echo "Installing firmware on the root filesystem."
+mkdir -p /lib/firmware /lib/firmware/mediatek
+for f in mt7662.bin mt7662_rom_patch.bin; do
+  if [ -f "$WORK/firmware/mediatek/$f" ]; then
+    cp -f "$WORK/firmware/mediatek/$f" "/lib/firmware/$f"
+    cp -f "$WORK/firmware/mediatek/$f" "/lib/firmware/mediatek/$f"
+  fi
+done
+
+# Some linux-firmware layouts expose USB names as aliases.
+ln -sf ../mt7662.bin /lib/firmware/mediatek/mt7662u.bin 2>/dev/null || true
+ln -sf ../mt7662_rom_patch.bin /lib/firmware/mediatek/mt7662u_rom_patch.bin 2>/dev/null || true
+
+echo
+echo "Before loading the driver:"
+if command -v lsusb >/dev/null 2>&1; then
+  lsusb | grep -i '0846:9053' || {
+    echo
+    echo "NETGEAR A6210 is not connected."
+    echo "Swap out the tiny dongle, plug in the A6210, wait 5 seconds, then press Enter."
+    read -r _
+    sleep 5
+    lsusb | grep -i '0846:9053' || {
+      echo "ERROR: A6210 still not detected."
+      exit 10
+    }
+  }
+fi
+
+dmesg -C 2>/dev/null || true
+
+for m in mt76x2u mt76x2_common mt76x02_usb mt76x02_lib mt76_usb mt76; do
+  rmmod "$m" 2>/dev/null || true
+done
+
+echo
+echo "Loading module stack:"
+for ko in   mt76.ko   mt76-usb.ko   mt76x02-lib.ko   mt76x02-usb.ko   mt76x2-common.ko   mt76x2u.ko
+do
+  echo "  $ko"
+  insmod "$MOD/$ko"
+  RC=$?
+  if [ $RC -ne 0 ]; then
+    echo "ERROR: insmod failed for $ko with exit code $RC"
+    echo
+    echo "Recent kernel messages:"
+    dmesg 2>/dev/null | tail -n 160
+    exit 11
+  fi
+done
+
+sleep 6
+
+echo
+echo "Loaded mt76 modules:"
+lsmod 2>/dev/null | grep -E '(^| )mt76' || true
+
+echo
+echo "Network interfaces:"
+ip link 2>/dev/null || true
+
+if command -v iw >/dev/null 2>&1; then
+  echo
+  iw dev 2>/dev/null || true
+fi
+
+echo
+echo "Recent kernel messages:"
+dmesg 2>/dev/null | tail -n 180
+
+echo
+if ip link 2>/dev/null | grep -Eq '^[0-9]+: (wlan|mlan|wl)'; then
+  echo "=== w4 SUCCESS: A wireless interface is present ==="
+  echo "Return to ChromeOS and open the Wi-Fi menu."
+  rm -f "$MARK"
+else
+  echo "=== w4 finished, but no wireless interface appeared ==="
+  echo "See $LOG for the kernel reason."
+fi
+
+echo "Log: $LOG"
