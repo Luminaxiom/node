@@ -1,0 +1,208 @@
+#!/bin/bash
+set -o pipefail
+
+REV=b7
+LOG=/home/chronos/user/MyFiles/Downloads/crosfix-b7.log
+mkdir -p /home/chronos/user/MyFiles/Downloads 2>/dev/null || true
+exec > >(tee "$LOG") 2>&1
+
+echo "=== $REV Node 26 + Remote Desktop Commander installer ==="
+echo "Log: $LOG"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: Run from VT-2 root."
+  exit 1
+fi
+
+export PATH="/usr/local/bin:/usr/local/node/bin:/usr/bin:/bin:$PATH"
+
+PY=/usr/local/bin/python3.11
+PYREAL=/usr/local/bin/python3.11.crosfix-real
+if [ -e "$PYREAL" ]; then
+  echo "Restoring original Python left by an earlier bootstrap."
+  rm -f "$PY"
+  mv "$PYREAL" "$PY"
+fi
+
+if [ ! -x "$PY" ]; then
+  echo "ERROR: /usr/local/bin/python3.11 is missing."
+  exit 2
+fi
+
+RUNTIME=/usr/local/node-lib
+mkdir -p "$RUNTIME"
+
+echo
+echo "[1/5] Installing the GNU runtime libraries Node 26 needs"
+
+BASE=https://deb.debian.org/debian/pool/main/g/gcc-12
+PKG1=libatomic1_12.2.0-14+deb12u1_amd64.deb
+PKG2=libgcc-s1_12.2.0-14+deb12u1_amd64.deb
+PKG3=libstdc++6_12.2.0-14+deb12u1_amd64.deb
+
+for pkg in "$PKG1" "$PKG2" "$PKG3"; do
+  echo "Downloading $pkg"
+  curl -fL "$BASE/$pkg" -o "/tmp/$pkg" || exit 3
+done
+
+LD_LIBRARY_PATH=/usr/local/lib64 "$PY" - "$RUNTIME" "/tmp/$PKG1" "/tmp/$PKG2" "/tmp/$PKG3" <<'PYEOF'
+import io, os, sys, tarfile
+
+outdir = sys.argv[1]
+debs = sys.argv[2:]
+os.makedirs(outdir, exist_ok=True)
+
+wanted = {
+    'libatomic.so.1.2.0',
+    'libgcc_s.so.1',
+    'libstdc++.so.6.0.30',
+}
+
+def data_payload(path):
+    with open(path, 'rb') as f:
+        if f.read(8) != b'!<arch>\n':
+            raise SystemExit(f'Not a Debian ar archive: {path}')
+        while True:
+            hdr = f.read(60)
+            if not hdr:
+                break
+            if len(hdr) != 60:
+                raise SystemExit(f'Truncated ar archive: {path}')
+            name = hdr[:16].decode('ascii', 'replace').strip().rstrip('/')
+            size = int(hdr[48:58].decode('ascii').strip())
+            data = f.read(size)
+            if size & 1:
+                f.read(1)
+            if name.startswith('data.tar'):
+                return data
+    raise SystemExit(f'No data.tar payload in {path}')
+
+found = set()
+for deb in debs:
+    payload = data_payload(deb)
+    with tarfile.open(fileobj=io.BytesIO(payload), mode='r:*') as tf:
+        for m in tf.getmembers():
+            base = os.path.basename(m.name)
+            if base in wanted and m.isfile():
+                src = tf.extractfile(m)
+                if src is None:
+                    continue
+                dest = os.path.join(outdir, base)
+                with open(dest, 'wb') as out:
+                    out.write(src.read())
+                os.chmod(dest, 0o755)
+                found.add(base)
+                print('installed', dest)
+
+missing = wanted - found
+if missing:
+    raise SystemExit('Missing libraries: ' + ', '.join(sorted(missing)))
+
+for link, target in {
+    'libatomic.so.1': 'libatomic.so.1.2.0',
+    'libstdc++.so.6': 'libstdc++.so.6.0.30',
+}.items():
+    p = os.path.join(outdir, link)
+    try:
+        os.unlink(p)
+    except FileNotFoundError:
+        pass
+    os.symlink(target, p)
+    print('linked', p, '->', target)
+PYEOF
+
+if [ $? -ne 0 ]; then
+  echo "ERROR: Runtime extraction failed."
+  exit 4
+fi
+
+echo
+echo "[2/5] Installing official Node.js 26.13.0"
+
+NODEVER=v26.13.0
+NODEFILE="node-$NODEVER-linux-x64.tar.xz"
+NODEURL="https://nodejs.org/dist/$NODEVER/$NODEFILE"
+SUMURL="https://nodejs.org/dist/$NODEVER/SHASUMS256.txt"
+
+rm -f "/tmp/$NODEFILE" /tmp/SHASUMS256.txt
+curl -fL "$NODEURL" -o "/tmp/$NODEFILE" || exit 5
+curl -fL "$SUMURL" -o /tmp/SHASUMS256.txt || exit 6
+
+(
+  cd /tmp || exit 1
+  grep "  $NODEFILE$" SHASUMS256.txt | sha256sum -c -
+) || {
+  echo "ERROR: Node SHA-256 verification failed."
+  exit 7
+}
+
+rm -rf /usr/local/node "/usr/local/node-$NODEVER-linux-x64"
+tar -xJf "/tmp/$NODEFILE" -C /usr/local || exit 8
+mv "/usr/local/node-$NODEVER-linux-x64" /usr/local/node || exit 9
+
+echo
+echo "[3/5] Creating Node/npm/npx launchers"
+
+cat > /usr/local/bin/node <<'EOF'
+#!/bin/sh
+LD_LIBRARY_PATH="/usr/local/node-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+exec /usr/local/node/bin/node "$@"
+EOF
+
+cat > /usr/local/bin/npm <<'EOF'
+#!/bin/sh
+PATH="/usr/local/bin:/usr/local/node/bin:$PATH"
+LD_LIBRARY_PATH="/usr/local/node-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH LD_LIBRARY_PATH
+exec /usr/local/node/bin/npm "$@"
+EOF
+
+cat > /usr/local/bin/npx <<'EOF'
+#!/bin/sh
+PATH="/usr/local/bin:/usr/local/node/bin:$PATH"
+LD_LIBRARY_PATH="/usr/local/node-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH LD_LIBRARY_PATH
+exec /usr/local/node/bin/npx "$@"
+EOF
+
+chmod 755 /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx
+
+node -v || exit 10
+npm -v || exit 11
+npx -v || exit 12
+
+echo
+echo "[4/5] Verifying Desktop Commander package"
+
+if ! npx --yes @wonderwhy-er/desktop-commander@latest remote --help > /tmp/rdc-help.txt 2>&1; then
+  echo "ERROR: Desktop Commander package did not start."
+  cat /tmp/rdc-help.txt
+  exit 13
+fi
+
+head -n 40 /tmp/rdc-help.txt || true
+
+echo
+echo "[5/5] Creating rdc command"
+
+cat > /usr/local/bin/rdc <<'EOF'
+#!/bin/sh
+PATH="/usr/local/bin:/usr/local/node/bin:$PATH"
+LD_LIBRARY_PATH="/usr/local/node-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH LD_LIBRARY_PATH
+exec /usr/local/bin/npx --yes @wonderwhy-er/desktop-commander@latest remote "$@"
+EOF
+
+chmod 755 /usr/local/bin/rdc
+
+echo
+echo "=== b7 COMPLETE ==="
+echo "Node: $(node -v)"
+echo "npm:  $(npm -v)"
+echo "npx:  $(npx -v)"
+echo
+echo "Remote Desktop Commander is ready."
+echo "Run: rdc"
+echo "On first run, use the pairing code printed in the terminal."
+echo "Log: $LOG"
