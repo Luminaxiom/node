@@ -1,0 +1,154 @@
+#!/bin/bash
+set -o pipefail
+
+REV=w3
+LOG=/home/chronos/user/MyFiles/Downloads/wifi-w3.log
+mkdir -p /home/chronos/user/MyFiles/Downloads 2>/dev/null || true
+exec > >(tee "$LOG") 2>&1
+
+echo "=== $REV NETGEAR A6210 installer ==="
+echo "Log: $LOG"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: Run from VT-2 root."
+  exit 1
+fi
+
+EXPECTED="5.15.213-24755-gd8271724728f"
+ACTUAL="$(uname -r)"
+if [ "$ACTUAL" != "$EXPECTED" ]; then
+  echo "ERROR: Kernel mismatch."
+  echo "Expected: $EXPECTED"
+  echo "Actual:   $ACTUAL"
+  exit 2
+fi
+
+TAG="a6210-kohaku-5.15.213-24755"
+BASE="https://github.com/Luminaxiom/node/releases/download/$TAG"
+TAR="a6210-chromeos-5.15.213-24755.tar.gz"
+SHA="$TAR.sha256"
+WORK=/usr/local/a6210
+TMP=/tmp/a6210-w3
+
+echo
+echo "[1/6] Downloading compiled A6210 bundle while Internet is available"
+rm -rf "$TMP"
+mkdir -p "$TMP"
+curl -fL "$BASE/$TAR" -o "$TMP/$TAR" || {
+  echo "ERROR: Could not download driver bundle."
+  exit 3
+}
+curl -fL "$BASE/$SHA" -o "$TMP/$SHA" || {
+  echo "ERROR: Could not download checksum."
+  exit 4
+}
+
+echo
+echo "[2/6] Verifying bundle"
+(
+  cd "$TMP" || exit 1
+  sha256sum -c "$SHA"
+) || {
+  echo "ERROR: Driver bundle checksum failed."
+  exit 5
+}
+
+rm -rf "$WORK"
+mkdir -p "$WORK"
+tar -xzf "$TMP/$TAR" -C "$WORK" || exit 6
+
+echo "Bundle kernel:"
+cat "$WORK/kernelrelease.txt" 2>/dev/null || true
+if [ "$(cat "$WORK/kernelrelease.txt" 2>/dev/null)" != "$EXPECTED" ]; then
+  echo "ERROR: Bundle was not built for this exact kernel."
+  exit 7
+fi
+
+echo
+echo "The driver is downloaded and verified."
+echo "NOW unplug the tiny Wi-Fi dongle and plug in the NETGEAR A6210."
+echo "Wait about 5 seconds, then press Enter here."
+read -r _
+
+echo
+echo "[3/6] Confirming NETGEAR USB device"
+sleep 3
+if command -v lsusb >/dev/null 2>&1; then
+  lsusb
+  if ! lsusb | grep -qi '0846:9053'; then
+    echo "ERROR: NETGEAR A6210 USB ID 0846:9053 is not present."
+    exit 8
+  fi
+else
+  echo "WARNING: lsusb unavailable; continuing."
+fi
+
+echo
+echo "[4/6] Installing firmware"
+FWBASE=/usr/local/lib/firmware
+mkdir -p "$FWBASE/mediatek"
+cp -f "$WORK"/firmware/mediatek/*.bin "$FWBASE/mediatek/" || exit 9
+ls -l "$FWBASE/mediatek"
+
+FWPARAM=/sys/module/firmware_class/parameters/path
+if [ -e "$FWPARAM" ]; then
+  echo "$FWBASE" > "$FWPARAM" 2>/dev/null || true
+  echo "firmware_class.path: $(cat "$FWPARAM" 2>/dev/null)"
+fi
+
+echo
+echo "[5/6] Loading A6210 module stack"
+dmesg -C 2>/dev/null || true
+
+# Remove stale mt76 modules if they are present and unused.
+for m in mt76x2u mt76x2_common mt76x02_usb mt76x02_lib mt76_usb mt76; do
+  rmmod "$m" 2>/dev/null || true
+done
+
+MOD="$WORK/modules"
+
+for ko in   mt76.ko   mt76-usb.ko   mt76x02-lib.ko   mt76x02-usb.ko   mt76x2-common.ko   mt76x2u.ko
+do
+  echo "Loading $ko"
+  insmod "$MOD/$ko"
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "ERROR: insmod failed for $ko with exit code $rc"
+    echo
+    echo "Recent kernel messages:"
+    dmesg 2>/dev/null | tail -n 120
+    exit 10
+  fi
+done
+
+echo
+echo "[6/6] Checking result"
+sleep 5
+
+echo "Loaded mt76 modules:"
+lsmod 2>/dev/null | grep -E '(^| )mt76' || true
+
+echo
+echo "Network interfaces:"
+ip link 2>/dev/null || true
+
+if command -v iw >/dev/null 2>&1; then
+  echo
+  echo "iw dev:"
+  iw dev 2>/dev/null || true
+fi
+
+echo
+echo "Recent kernel messages:"
+dmesg 2>/dev/null | tail -n 160
+
+echo
+if ip link 2>/dev/null | grep -Eq '^[0-9]+: (wlan|mlan|wl)'; then
+  echo "=== w3 SUCCESS: a wireless interface is present ==="
+  echo "Return to ChromeOS and open the Wi-Fi menu."
+else
+  echo "=== w3 finished, but no wireless interface was detected ==="
+  echo "See $LOG for the kernel reason."
+fi
+
+echo "Log: $LOG"
