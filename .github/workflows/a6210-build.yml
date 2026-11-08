@@ -43,6 +43,7 @@ jobs:
           cd kernel
           export ARCH=x86_64
           export LLVM=1
+          export CHROMEOS_KERNEL_FAMILY=chromeos
 
           ./chromeos/scripts/prepareconfig chromeos-intel-pineview
           make ARCH=x86_64 LLVM=1 olddefconfig
