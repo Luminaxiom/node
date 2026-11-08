@@ -1,0 +1,159 @@
+name: Build A6210 driver for ChromeOS R158 hatch
+
+on:
+  push:
+    paths:
+      - ".github/workflows/a6210-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev libelf-dev dwarves \
+            python3 rsync clang llvm lld git curl xz-utils zstd
+
+      - name: Fetch exact ChromeOS kernel source
+        run: |
+          set -euxo pipefail
+          git clone \
+            --filter=blob:none \
+            --single-branch \
+            --branch release-R158-16868.B-chromeos-5.15 \
+            https://chromium.googlesource.com/chromiumos/third_party/kernel \
+            kernel
+          cd kernel
+
+          # The Chromebook reports 5.15.213-24755-gd8271724728f.
+          # Use that exact source commit if it exists in the release branch.
+          if git cat-file -e d8271724728f^{commit} 2>/dev/null; then
+            git checkout d8271724728f
+          else
+            git fetch origin d8271724728f || true
+            git cat-file -e d8271724728f^{commit}
+            git checkout d8271724728f
+          fi
+
+          git rev-parse HEAD
+          git status --short
+
+      - name: Generate hatch kernel configuration
+        run: |
+          set -euxo pipefail
+          cd kernel
+          export ARCH=x86_64
+          export CHROMEOS_KERNEL_FAMILY=chromeos
+          export LLVM=1
+
+          ./chromeos/scripts/prepareconfig chromeos-intel-pineview
+          make ARCH=x86_64 LLVM=1 olddefconfig
+
+          echo "Original mt76 config:"
+          grep -E '^CONFIG_(MT76|MT76x02|MT76x2)' .config || true
+
+          ./scripts/config --module MT76x2U
+          make ARCH=x86_64 LLVM=1 olddefconfig
+
+          echo "Updated mt76 config:"
+          grep -E '^CONFIG_(MT76|MT76x02|MT76x2)' .config || true
+
+          grep -q '^CONFIG_MT76x2U=m$' .config
+
+          echo "Kernel release:"
+          make -s ARCH=x86_64 LLVM=1 kernelrelease
+
+      - name: Prepare kernel ABI and build mt76 modules
+        run: |
+          set -euxo pipefail
+          cd kernel
+          export ARCH=x86_64
+          export LLVM=1
+
+          EXPECTED="5.15.213-24755-gd8271724728f"
+          ACTUAL="$(make -s ARCH=x86_64 LLVM=1 kernelrelease)"
+          echo "Expected: $EXPECTED"
+          echo "Actual:   $ACTUAL"
+
+          if grep -q '^CONFIG_MODVERSIONS=y$' .config; then
+            echo "CONFIG_MODVERSIONS=y: building vmlinux first to generate symbol CRCs"
+            make -j2 ARCH=x86_64 LLVM=1 vmlinux
+          else
+            echo "CONFIG_MODVERSIONS is not enabled"
+            make -j2 ARCH=x86_64 LLVM=1 modules_prepare
+          fi
+
+          make -j2 ARCH=x86_64 LLVM=1 M=drivers/net/wireless/mediatek/mt76 modules
+
+          mkdir -p ../package/modules
+          for name in \
+            mt76.ko \
+            mt76-usb.ko \
+            mt76x02-lib.ko \
+            mt76x02-usb.ko \
+            mt76x2-common.ko \
+            mt76x2u.ko
+          do
+            p="$(find drivers/net/wireless/mediatek/mt76 -name "$name" -print -quit)"
+            test -n "$p"
+            cp -v "$p" ../package/modules/
+          done
+
+          printf '%s\n' "$ACTUAL" > ../package/kernelrelease.txt
+          git rev-parse HEAD > ../package/kernel-commit.txt
+          grep -E '^CONFIG_(MODULES|MODVERSIONS|MODULE_SIG|MT76|MT76x02|MT76x2|MAC80211|CFG80211|USB)=' .config \
+            > ../package/kernel-config-relevant.txt || true
+
+          for ko in ../package/modules/*.ko; do
+            echo "===== $ko ====="
+            modinfo "$ko" || true
+          done
+
+      - name: Fetch MediaTek firmware
+        run: |
+          set -euxo pipefail
+          mkdir -p package/firmware/mediatek
+
+          BASE="https://kernel.googlesource.com/pub/scm/linux/kernel/git/firmware/linux-firmware/+/refs/tags/20260221/mediatek"
+
+          for f in mt7662.bin mt7662_rom_patch.bin mt7662u.bin mt7662u_rom_patch.bin; do
+            curl -fsSL "$BASE/$f?format=TEXT" | base64 -d > "package/firmware/mediatek/$f"
+            test -s "package/firmware/mediatek/$f"
+          done
+
+          ls -l package/firmware/mediatek
+
+      - name: Create bundle
+        run: |
+          set -euxo pipefail
+          cat > package/README.txt <<'EOF'
+          NETGEAR A6210 / MT7612U module bundle
+          Target Chromebook kernel:
+            5.15.213-24755-gd8271724728f
+
+          USB ID:
+            0846:9053
+
+          This bundle is intended only for the exact target kernel above.
+          EOF
+
+          tar -C package -czf a6210-chromeos-5.15.213-24755.tar.gz .
+          sha256sum a6210-chromeos-5.15.213-24755.tar.gz > a6210-chromeos-5.15.213-24755.tar.gz.sha256
+          ls -lh a6210-chromeos-5.15.213-24755.tar.gz*
+
+      - name: Upload driver bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: a6210-chromeos-5.15.213-24755
+          path: |
+            a6210-chromeos-5.15.213-24755.tar.gz
+            a6210-chromeos-5.15.213-24755.tar.gz.sha256
+          if-no-files-found: error
