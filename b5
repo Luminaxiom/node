@@ -1,0 +1,165 @@
+#!/bin/bash
+set -o pipefail
+
+REV=b5
+LOG=/home/chronos/user/MyFiles/Downloads/crosfix-b5.log
+mkdir -p /home/chronos/user/MyFiles/Downloads 2>/dev/null || true
+exec > >(tee "$LOG") 2>&1
+
+echo "=== $REV direct Node/RDC bootstrap ==="
+echo "Log: $LOG"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: Run from the VT-2 root shell."
+  exit 1
+fi
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+echo
+echo "[1/5] Cleaning up prior Python wrappers"
+PY=/usr/local/bin/python3.11
+PYREAL=/usr/local/bin/python3.11.crosfix-real
+if [ -e "$PYREAL" ]; then
+  echo "Restoring original python3.11 left by b2/b3."
+  rm -f "$PY"
+  mv "$PYREAL" "$PY"
+fi
+
+echo
+echo "[2/5] Installing only libatomic for Node 26"
+mkdir -p /usr/local/node-lib
+LIBATOMIC="$(find /usr/local /usr/lib /lib \( -name 'libatomic.so.1' -o -name 'libatomic.so.1.*' \) -print -quit 2>/dev/null)"
+
+if [ -n "$LIBATOMIC" ]; then
+  echo "Existing libatomic found: $LIBATOMIC"
+  LIBDIR="${LIBATOMIC%/*}"
+else
+  DEB=/tmp/libatomic1.deb
+  URL="https://deb.debian.org/debian/pool/main/g/gcc-12/libatomic1_12.2.0-14+deb12u1_amd64.deb"
+  echo "Downloading Debian libatomic1 runtime."
+  curl -fL "$URL" -o "$DEB" || exit 2
+  PYLIB=/usr/local/lib64
+  if [ ! -x "$PY" ]; then
+    echo "ERROR: Python 3.11 is unavailable for extracting libatomic."
+    exit 3
+  fi
+  LD_LIBRARY_PATH="$PYLIB" "$PY" - "$DEB" /usr/local/node-lib <<'PYEOF'
+import io, os, sys, tarfile
+deb, outdir = sys.argv[1], sys.argv[2]
+os.makedirs(outdir, exist_ok=True)
+with open(deb, 'rb') as f:
+    if f.read(8) != b'!<arch>\n':
+        raise SystemExit('Not a valid Debian ar archive')
+    payload = None
+    while True:
+        h = f.read(60)
+        if not h:
+            break
+        if len(h) != 60:
+            raise SystemExit('Truncated ar header')
+        name = h[:16].decode('ascii', 'replace').strip().rstrip('/')
+        size = int(h[48:58].decode('ascii').strip())
+        data = f.read(size)
+        if size & 1:
+            f.read(1)
+        if name.startswith('data.tar'):
+            payload = data
+            break
+if payload is None:
+    raise SystemExit('No data.tar payload in Debian package')
+with tarfile.open(fileobj=io.BytesIO(payload), mode='r:*') as tf:
+    member = next((m for m in tf.getmembers() if m.name.endswith('/libatomic.so.1.2.0')), None)
+    if member is None:
+        raise SystemExit('libatomic.so.1.2.0 not found in package')
+    src = tf.extractfile(member)
+    if src is None:
+        raise SystemExit('Could not extract libatomic')
+    dest = os.path.join(outdir, 'libatomic.so.1.2.0')
+    with open(dest, 'wb') as out:
+        out.write(src.read())
+    os.chmod(dest, 0o755)
+link = os.path.join(outdir, 'libatomic.so.1')
+try:
+    os.unlink(link)
+except FileNotFoundError:
+    pass
+os.symlink('libatomic.so.1.2.0', link)
+print(dest)
+PYEOF
+  if [ $? -ne 0 ]; then
+    echo "ERROR: Could not extract libatomic."
+    exit 4
+  fi
+  LIBDIR=/usr/local/node-lib
+fi
+
+echo "Node runtime library dir: $LIBDIR"
+
+echo
+echo "[3/5] Installing official Node.js 26.13.0 binary"
+NODEVER=v26.13.0
+NODEFILE="node-$NODEVER-linux-x64.tar.xz"
+NODEURL="https://nodejs.org/dist/$NODEVER/$NODEFILE"
+SUMURL="https://nodejs.org/dist/$NODEVER/SHASUMS256.txt"
+rm -f "/tmp/$NODEFILE" /tmp/SHASUMS256.txt
+curl -fL "$NODEURL" -o "/tmp/$NODEFILE" || exit 5
+curl -fL "$SUMURL" -o /tmp/SHASUMS256.txt || exit 6
+if command -v sha256sum >/dev/null 2>&1; then
+  ( cd /tmp && grep "  $NODEFILE$" SHASUMS256.txt | sha256sum -c - ) || exit 7
+fi
+rm -rf /usr/local/node "/usr/local/node-$NODEVER-linux-x64"
+tar -xJf "/tmp/$NODEFILE" -C /usr/local || exit 8
+mv "/usr/local/node-$NODEVER-linux-x64" /usr/local/node || exit 9
+
+echo
+echo "[4/5] Creating Node/npm/npx wrappers"
+cat > /usr/local/bin/node <<EOF
+#!/bin/sh
+LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+exec /usr/local/node/bin/node "$@"
+EOF
+chmod 755 /usr/local/bin/node
+cat > /usr/local/bin/npm <<EOF
+#!/bin/sh
+PATH="/usr/local/bin:/usr/local/node/bin:$PATH"
+LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH LD_LIBRARY_PATH
+exec /usr/local/node/bin/npm "$@"
+EOF
+chmod 755 /usr/local/bin/npm
+cat > /usr/local/bin/npx <<EOF
+#!/bin/sh
+PATH="/usr/local/bin:/usr/local/node/bin:$PATH"
+LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH LD_LIBRARY_PATH
+exec /usr/local/node/bin/npx "$@"
+EOF
+chmod 755 /usr/local/bin/npx
+
+echo "Testing Node:"
+node -v || exit 10
+echo "Testing npm:"
+npm -v || exit 11
+echo "Testing npx:"
+npx -v || exit 12
+
+echo
+echo "[5/5] Creating RDC launcher"
+cat > /usr/local/bin/rdc <<'EOF'
+#!/bin/sh
+PATH="/usr/local/bin:/usr/local/node/bin:$PATH"
+export PATH
+exec /usr/local/bin/npx --yes @wonderwhy-er/desktop-commander@latest remote "$@"
+EOF
+chmod 755 /usr/local/bin/rdc
+
+echo
+echo "=== b5 COMPLETE ==="
+echo "Node: $(node -v)"
+echo "npm:  $(npm -v)"
+echo "npx:  $(npx -v)"
+echo "RDC launcher: /usr/local/bin/rdc"
+echo "Next command: rdc"
+echo "Log: $LOG"
