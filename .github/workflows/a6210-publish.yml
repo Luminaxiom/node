@@ -1,0 +1,52 @@
+name: Publish A6210 ChromeOS driver bundle
+
+on:
+  push:
+    paths:
+      - ".github/workflows/a6210-publish.yml"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download successful A6210 artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          curl -fL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/13629275832/zip" \
+            -o artifact.zip
+          mkdir artifact
+          unzip artifact.zip -d artifact
+          find artifact -maxdepth 2 -type f -ls
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          TAG="a6210-kohaku-5.15.213-24755"
+          TAR="artifact/a6210-chromeos-5.15.213-24755.tar.gz"
+          SHA="artifact/a6210-chromeos-5.15.213-24755.tar.gz.sha256"
+
+          test -s "$TAR"
+          test -s "$SHA"
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "NETGEAR A6210 driver for ChromeOS 5.15.213-24755" \
+              --notes "Compiled for Samsung Galaxy Chromebook (kohaku/hatch) kernel 5.15.213-24755-gd8271724728f. Contains mt76x2u module stack and MediaTek firmware."
+          fi
+
+          gh release upload "$TAG" "$TAR" "$SHA" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
