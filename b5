@@ -116,25 +116,25 @@ echo
 echo "[4/5] Creating Node/npm/npx wrappers"
 cat > /usr/local/bin/node <<EOF
 #!/bin/sh
-LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+LD_LIBRARY_PATH="$LIBDIR\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 export LD_LIBRARY_PATH
-exec /usr/local/node/bin/node "$@"
+exec /usr/local/node/bin/node "\$@"
 EOF
 chmod 755 /usr/local/bin/node
 cat > /usr/local/bin/npm <<EOF
 #!/bin/sh
-PATH="/usr/local/bin:/usr/local/node/bin:$PATH"
-LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+PATH="/usr/local/bin:/usr/local/node/bin:\$PATH"
+LD_LIBRARY_PATH="$LIBDIR\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 export PATH LD_LIBRARY_PATH
-exec /usr/local/node/bin/npm "$@"
+exec /usr/local/node/bin/npm "\$@"
 EOF
 chmod 755 /usr/local/bin/npm
 cat > /usr/local/bin/npx <<EOF
 #!/bin/sh
-PATH="/usr/local/bin:/usr/local/node/bin:$PATH"
-LD_LIBRARY_PATH="$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+PATH="/usr/local/bin:/usr/local/node/bin:\$PATH"
+LD_LIBRARY_PATH="$LIBDIR\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 export PATH LD_LIBRARY_PATH
-exec /usr/local/node/bin/npx "$@"
+exec /usr/local/node/bin/npx "\$@"
 EOF
 chmod 755 /usr/local/bin/npx
 
