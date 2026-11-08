@@ -57,10 +57,10 @@ jobs:
           ./scripts/config --module CFG80211
           ./scripts/config --module MAC80211
           ./scripts/config --module MT76_CORE
-          ./scripts/config --module MT76x02_LIB
-          ./scripts/config --module MT76x02_USB
-          ./scripts/config --module MT76x2_COMMON
-          ./scripts/config --module MT76x2U
+          ./scripts/config --keep-case --module MT76x02_LIB
+          ./scripts/config --keep-case --module MT76x02_USB
+          ./scripts/config --keep-case --module MT76x2_COMMON
+          ./scripts/config --keep-case --module MT76x2U
 
           make ARCH=x86_64 LLVM=1 olddefconfig
 
