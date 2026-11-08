@@ -1,0 +1,168 @@
+name: Build OpenWrt A6210 crosvm guest
+
+on:
+  push:
+    paths:
+      - ".github/workflows/openwrt-a6210-router.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install ImageBuilder dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential gawk gettext libncurses-dev libssl-dev rsync unzip wget zstd python3
+
+      - name: Download OpenWrt 25.12.6 x86-64 ImageBuilder
+        run: |
+          set -euxo pipefail
+          URL="https://downloads.openwrt.org/releases/25.12.6/targets/x86/64"
+          FILE="openwrt-imagebuilder-25.12.6-x86-64.Linux-x86_64.tar.zst"
+          wget -q "$URL/$FILE"
+          echo "a792e29bd2233cda67a0823030bfb53c0b61fbb3836b2063e88adf89730d563b  $FILE" | sha256sum -c -
+          tar --zstd -xf "$FILE"
+          mv openwrt-imagebuilder-25.12.6-x86-64.Linux-x86_64 imagebuilder
+
+      - name: Add crosvm router configuration helpers
+        run: |
+          set -euxo pipefail
+          mkdir -p files/etc/uci-defaults files/root
+
+          cat > files/etc/uci-defaults/99-crosvm-router <<'EOF'
+          #!/bin/sh
+          set -e
+
+          # Keep the standard LAN bridge, but give it a tiny point-to-point subnet
+          # for the ChromeOS host <-> OpenWrt guest link.
+          uci set network.lan.ipaddr='172.31.55.1'
+          uci set network.lan.netmask='255.255.255.252'
+
+          # A DHCP client that will be attached to the A6210 station interface.
+          uci -q delete network.wwan
+          uci set network.wwan='interface'
+          uci set network.wwan.proto='dhcp'
+
+          # Put WWAN in the normal masqueraded WAN firewall zone.
+          uci add_list firewall.@zone[1].network='wwan'
+
+          uci commit network
+          uci commit firewall
+          exit 0
+          EOF
+          chmod 755 files/etc/uci-defaults/99-crosvm-router
+
+          cat > files/root/activate-a6210.sh <<'EOF'
+          #!/bin/sh
+          set -e
+
+          if [ "$#" -lt 2 ]; then
+            echo "Usage: $0 <SSID> <WIFI_PASSWORD>"
+            exit 2
+          fi
+
+          SSID="$1"
+          KEY="$2"
+
+          echo "Waiting for MediaTek A6210 radio..."
+          n=0
+          while [ "$n" -lt 30 ]; do
+            if iw phy 2>/dev/null | grep -q '^Wiphy '; then
+              break
+            fi
+            n=$((n+1))
+            sleep 1
+          done
+
+          if ! iw phy 2>/dev/null | grep -q '^Wiphy '; then
+            echo "ERROR: no Wi-Fi PHY appeared."
+            dmesg | tail -n 100
+            exit 3
+          fi
+
+          # Generate radio sections if this is the first time the USB radio appeared.
+          wifi config 2>/dev/null || true
+
+          RADIO="$(uci show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.=]*\)=wifi-device.*/\1/p" | head -n1)"
+          [ -n "$RADIO" ] || RADIO="radio0"
+
+          uci set wireless."$RADIO".disabled='0'
+          uci set wireless."$RADIO".country='US'
+
+          uci -q delete wireless.a6210_sta
+          uci set wireless.a6210_sta='wifi-iface'
+          uci set wireless.a6210_sta.device="$RADIO"
+          uci set wireless.a6210_sta.mode='sta'
+          uci set wireless.a6210_sta.network='wwan'
+          uci set wireless.a6210_sta.ssid="$SSID"
+          uci set wireless.a6210_sta.encryption='psk2'
+          uci set wireless.a6210_sta.key="$KEY"
+
+          uci commit wireless
+          uci commit network
+          wifi reload
+
+          echo "Configured station on $RADIO for SSID: $SSID"
+          sleep 5
+          ubus call network.interface.wwan status 2>/dev/null || true
+          iw dev 2>/dev/null || true
+          EOF
+          chmod 700 files/root/activate-a6210.sh
+
+          cat > files/root/a6210-status.sh <<'EOF'
+          #!/bin/sh
+          echo "=== USB ==="
+          lsusb 2>/dev/null || true
+          echo "=== MODULES ==="
+          lsmod | grep -E 'mt76|mac80211|cfg80211' || true
+          echo "=== WIFI ==="
+          iw dev 2>/dev/null || true
+          echo "=== WWAN ==="
+          ubus call network.interface.wwan status 2>/dev/null || true
+          echo "=== ROUTES ==="
+          ip route
+          echo "=== PING ==="
+          ping -c 2 -W 2 1.1.1.1 2>/dev/null || true
+          EOF
+          chmod 755 files/root/a6210-status.sh
+
+      - name: Build custom x86-64 image
+        run: |
+          set -euxo pipefail
+          cd imagebuilder
+          make image \
+            PACKAGES="kmod-mt76x2u iw iwinfo wpad-basic-mbedtls usbutils" \
+            FILES="$GITHUB_WORKSPACE/files" \
+            CONFIG_TARGET_ROOTFS_PARTSIZE=128
+          find bin/targets/x86/64 -maxdepth 1 -type f -printf '%f %s bytes\n'
+
+      - name: Collect kernel and ext4 rootfs
+        run: |
+          set -euxo pipefail
+          mkdir -p release
+          cp imagebuilder/bin/targets/x86/64/*generic-kernel.bin release/openwrt-a6210-kernel.bin
+          cp imagebuilder/bin/targets/x86/64/*generic-ext4-rootfs.img.gz release/openwrt-a6210-rootfs.img.gz
+          gzip -dk release/openwrt-a6210-rootfs.img.gz
+          cd release
+          sha256sum openwrt-a6210-kernel.bin openwrt-a6210-rootfs.img openwrt-a6210-rootfs.img.gz > SHA256SUMS
+          ls -lh
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          TAG="openwrt-a6210-poc-25.12.6"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "OpenWrt A6210 crosvm proof-of-concept" \
+              --notes "OpenWrt 25.12.6 x86-64 guest with kmod-mt76x2u and crosvm router helpers. No Wi-Fi credentials are embedded."
+          fi
+          gh release upload "$TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
