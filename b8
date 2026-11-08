@@ -1,0 +1,61 @@
+#!/bin/bash
+set -o pipefail
+
+REV=b8
+LOG=/home/chronos/user/MyFiles/Downloads/crosfix-b8.log
+mkdir -p /home/chronos/user/MyFiles/Downloads 2>/dev/null || true
+exec > >(tee "$LOG") 2>&1
+
+echo "=== $REV Remote Desktop Commander npm-cache fix ==="
+echo "Log: $LOG"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: Run from VT-2 root."
+  exit 1
+fi
+
+export PATH="/usr/local/bin:/usr/local/node/bin:/usr/bin:/bin:$PATH"
+export LD_LIBRARY_PATH="/usr/local/node-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+echo
+echo "[1/3] Verifying existing Node install"
+node -v || exit 2
+npm -v || exit 3
+npx -v || exit 4
+
+echo
+echo "[2/3] Creating writable npm/RDC home and cache"
+export HOME=/usr/local/rdc-home
+export NPM_CONFIG_CACHE=/usr/local/npm-cache
+mkdir -p "$HOME" "$NPM_CONFIG_CACHE" || exit 5
+chmod 755 "$HOME" "$NPM_CONFIG_CACHE"
+echo "HOME=$HOME"
+echo "NPM_CONFIG_CACHE=$NPM_CONFIG_CACHE"
+
+echo
+echo "[3/3] Verifying Desktop Commander"
+if ! npx --yes @wonderwhy-er/desktop-commander@latest remote --help > /tmp/rdc-help.txt 2>&1; then
+  echo "ERROR: Desktop Commander package did not start."
+  cat /tmp/rdc-help.txt
+  exit 6
+fi
+
+cat /tmp/rdc-help.txt
+
+cat > /usr/local/bin/rdc <<'EOF'
+#!/bin/sh
+PATH="/usr/local/bin:/usr/local/node/bin:$PATH"
+LD_LIBRARY_PATH="/usr/local/node-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+HOME=/usr/local/rdc-home
+NPM_CONFIG_CACHE=/usr/local/npm-cache
+export PATH LD_LIBRARY_PATH HOME NPM_CONFIG_CACHE
+exec /usr/local/bin/npx --yes @wonderwhy-er/desktop-commander@latest remote "$@"
+EOF
+
+chmod 755 /usr/local/bin/rdc
+
+echo
+echo "=== b8 COMPLETE ==="
+echo "Remote Desktop Commander is ready."
+echo "Run: rdc"
+echo "Log: $LOG"
