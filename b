@@ -105,14 +105,49 @@ if ! /usr/local/bin/python3.11 -V; then
 fi
 
 echo
-echo "[4/6] Retrying only the package that actually failed"
+echo "[4/6] Making Python loader-safe inside Portage"
+
+PY=/usr/local/bin/python3.11
+PYREAL=/usr/local/bin/python3.11.crosfix-real
+PYWRAPPED=0
+
+if env -u LD_LIBRARY_PATH "$PY" -V >/dev/null 2>&1; then
+  echo "Python already starts without LD_LIBRARY_PATH; no wrapper needed."
+else
+  echo "Python fails when LD_LIBRARY_PATH is stripped. Installing temporary wrapper."
+  if [ ! -e "$PYREAL" ]; then
+    mv "$PY" "$PYREAL" || exit 7
+  fi
+  cat > "$PY" <<EOF
+#!/bin/sh
+LD_LIBRARY_PATH="$LIBPYDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+exec "$PYREAL" "\$@"
+EOF
+  chmod 755 "$PY"
+  PYWRAPPED=1
+
+  if ! env -u LD_LIBRARY_PATH "$PY" -V; then
+    echo "ERROR: Python wrapper did not solve the loader failure."
+    exit 7
+  fi
+fi
+
+echo "Retrying only sys-apps/flashrom-tester."
 
 if ! emerge --jobs=1 sys-apps/flashrom-tester; then
-  echo "ERROR: flashrom-tester still fails. Stopping here rather than rerunning all 226 packages."
-  exit 7
+  echo "ERROR: flashrom-tester still fails even with loader-safe Python."
+  echo "Stopping here; see $LOG."
+  exit 8
 fi
 
 echo "flashrom-tester succeeded."
+
+if [ "$PYWRAPPED" -eq 1 ] && [ -e "$PYREAL" ]; then
+  rm -f "$PY"
+  mv "$PYREAL" "$PY"
+  echo "Restored the original python3.11 executable."
+fi
 
 echo
 echo "[5/6] Completing virtual/target-os-dev"
