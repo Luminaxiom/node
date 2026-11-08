@@ -1,0 +1,80 @@
+#!/bin/bash
+set -o pipefail
+
+REV=w2
+LOG=/home/chronos/user/MyFiles/Downloads/wifi-w2.log
+mkdir -p /home/chronos/user/MyFiles/Downloads 2>/dev/null || true
+exec > >(tee "$LOG") 2>&1
+
+echo "=== $REV A6210 external-module feasibility ==="
+echo "Log: $LOG"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: Run from VT-2 root."
+  exit 1
+fi
+
+KREL="$(uname -r)"
+MODDIR="/lib/modules/$KREL"
+
+echo
+echo "[1/6] Kernel"
+echo "Kernel: $KREL"
+echo "Architecture: $(uname -m)"
+echo "Command line:"
+cat /proc/cmdline 2>/dev/null || true
+
+echo
+echo "[2/6] Full mt76 module inventory"
+if [ -d "$MODDIR/kernel/drivers/net/wireless/mediatek/mt76" ]; then
+  find "$MODDIR/kernel/drivers/net/wireless/mediatek/mt76" -type f -maxdepth 3 -print | sort
+else
+  echo "No mt76 module directory."
+fi
+
+echo
+echo "[3/6] Kernel config for mt76/module loading"
+if [ -r /proc/config.gz ]; then
+  zgrep -E 'CONFIG_(MT76|MT76X2|MT76X02|CFG80211|MAC80211|MODULES|MODULE_SIG|MODVERSIONS)' /proc/config.gz || true
+elif [ -r "/boot/config-$KREL" ]; then
+  grep -E 'CONFIG_(MT76|MT76X2|MT76X02|CFG80211|MAC80211|MODULES|MODULE_SIG|MODVERSIONS)' "/boot/config-$KREL" || true
+else
+  echo "No readable /proc/config.gz or /boot/config-$KREL"
+fi
+
+echo
+echo "[4/6] Module-signing policy"
+if [ -r /proc/sys/kernel/module_sig_enforce ]; then
+  echo -n "module_sig_enforce: "
+  cat /proc/sys/kernel/module_sig_enforce
+fi
+if [ -r /sys/module/module/parameters/sig_enforce ]; then
+  echo -n "sig_enforce parameter: "
+  cat /sys/module/module/parameters/sig_enforce
+fi
+grep -oE 'module.sig_enforce=[^ ]+' /proc/cmdline 2>/dev/null || true
+dmesg 2>/dev/null | grep -iE 'module.*sign|signature|verification' | tail -n 40 || true
+
+echo
+echo "[5/6] Build metadata / headers"
+for p in "$MODDIR/build" "$MODDIR/source" /usr/src/linux /usr/src/linux-headers-"$KREL" /usr/local/usr/src/linux; do
+  if [ -e "$p" ]; then
+    ls -ld "$p"
+  fi
+done
+echo "Compiler candidates:"
+for x in clang gcc make ld; do
+  command -v "$x" 2>/dev/null || echo "$x: missing"
+done
+
+echo
+echo "[6/6] USB + firmware state"
+if command -v lsusb >/dev/null 2>&1; then
+  lsusb | grep -i '0846:9053' || echo "A6210 not connected."
+fi
+echo "Candidate MediaTek firmware:"
+find /lib/firmware /usr/local/lib/firmware -type f 2>/dev/null | grep -Ei 'mt76|mt7662' | sort || true
+
+echo
+echo "=== $REV COMPLETE ==="
+echo "Log: $LOG"
