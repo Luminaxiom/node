@@ -1,0 +1,85 @@
+#!/bin/bash
+set -o pipefail
+
+REV=w1
+LOG=/home/chronos/user/MyFiles/Downloads/wifi-w1.log
+mkdir -p /home/chronos/user/MyFiles/Downloads 2>/dev/null || true
+exec > >(tee "$LOG") 2>&1
+
+echo "=== $REV NETGEAR A6210 diagnostic ==="
+echo "Log: $LOG"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: Run from VT-2 root."
+  exit 1
+fi
+
+echo
+echo "[1/5] System"
+echo "Kernel: $(uname -r)"
+echo "Architecture: $(uname -m)"
+
+echo
+echo "[2/5] USB detection"
+if command -v lsusb >/dev/null 2>&1; then
+  lsusb
+  echo
+  echo "A6210 match:"
+  lsusb | grep -i '0846:9053' || echo "0846:9053 not present right now."
+else
+  echo "lsusb is not installed."
+fi
+
+echo
+echo "[3/5] mt76x2u module"
+KREL="$(uname -r)"
+MODDIR="/lib/modules/$KREL"
+echo "Module directory: $MODDIR"
+if [ -d "$MODDIR" ]; then
+  find "$MODDIR" -type f \( -name 'mt76x2u.ko*' -o -name 'mt76x2.ko*' -o -name 'mt76.ko*' \) -print
+else
+  echo "No /lib/modules/$KREL directory."
+fi
+
+echo
+echo "modinfo mt76x2u:"
+if command -v modinfo >/dev/null 2>&1; then
+  modinfo mt76x2u 2>&1 || true
+else
+  echo "modinfo unavailable."
+fi
+
+echo
+echo "[4/5] Firmware"
+find /lib/firmware /usr/local/lib/firmware -type f \( -name 'mt7662.bin' -o -name 'mt7662_rom_patch.bin' -o -name 'mt7662u.bin' -o -name 'mt7662u_rom_patch.bin' \) -print 2>/dev/null || true
+
+echo
+echo "[5/5] Attempting driver load"
+dmesg -C 2>/dev/null || true
+if command -v modprobe >/dev/null 2>&1; then
+  modprobe mt76x2u 2>&1
+  RC=$?
+  echo "modprobe exit code: $RC"
+else
+  echo "modprobe unavailable."
+  RC=127
+fi
+
+sleep 3
+
+echo
+echo "Loaded mt76 modules:"
+lsmod 2>/dev/null | grep -E '(^| )mt76' || true
+
+echo
+echo "Network interfaces:"
+ip link 2>/dev/null || true
+
+echo
+echo "Recent kernel messages:"
+dmesg 2>/dev/null | tail -n 120
+
+echo
+echo "=== $REV COMPLETE ==="
+echo "Log: $LOG"
+exit $RC
