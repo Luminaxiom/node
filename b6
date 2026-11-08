@@ -1,0 +1,198 @@
+#!/bin/bash
+set -o pipefail
+
+REV=b6
+LOG=/home/chronos/user/MyFiles/Downloads/crosfix-b6.log
+mkdir -p /home/chronos/user/MyFiles/Downloads 2>/dev/null || true
+exec > >(tee "$LOG") 2>&1
+
+echo "=== $REV direct Node/RDC bootstrap ==="
+echo "Log: $LOG"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "ERROR: Run from the VT-2 root shell."
+  exit 1
+fi
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:$PATH"
+RUNTIME=/usr/local/node-lib
+mkdir -p "$RUNTIME"
+
+echo
+echo "[1/4] Restoring Python if an earlier repair left a wrapper"
+PY=/usr/local/bin/python3.11
+PYREAL=/usr/local/bin/python3.11.crosfix-real
+if [ -e "$PYREAL" ]; then
+  rm -f "$PY"
+  mv "$PYREAL" "$PY"
+  echo "Restored original python3.11."
+else
+  echo "Python already clean."
+fi
+
+echo
+echo "[2/4] Installing Node 26 GNU runtime libraries"
+BASE=https://deb.debian.org/debian/pool/main/g/gcc-12
+for pkg in \
+  libatomic1_12.2.0-14+deb12u1_amd64.deb \
+  libgcc-s1_12.2.0-14+deb12u1_amd64.deb \
+  libstdc++6_12.2.0-14+deb12u1_amd64.deb
+do
+  echo "Downloading $pkg"
+  curl -fL "$BASE/$pkg" -o "/tmp/$pkg" || exit 2
+done
+
+if [ ! -x "$PY" ]; then
+  echo "ERROR: Python 3.11 is unavailable for extracting the runtime packages."
+  exit 3
+fi
+
+LD_LIBRARY_PATH=/usr/local/lib64 "$PY" - "$RUNTIME" \
+  /tmp/libatomic1_12.2.0-14+deb12u1_amd64.deb \
+  /tmp/libgcc-s1_12.2.0-14+deb12u1_amd64.deb \
+  /tmp/libstdc++6_12.2.0-14+deb12u1_amd64.deb <<'PYEOF'
+import io, os, sys, tarfile
+
+outdir = sys.argv[1]
+os.makedirs(outdir, exist_ok=True)
+wanted = {
+    'libatomic.so.1.2.0',
+    'libgcc_s.so.1',
+    'libstdc++.so.6.0.30',
+}
+
+def data_payload(path):
+    with open(path, 'rb') as f:
+        if f.read(8) != b'!<arch>\n':
+            raise SystemExit(f'Not a valid Debian ar archive: {path}')
+        while True:
+            h = f.read(60)
+            if not h:
+                break
+            if len(h) != 60:
+                raise SystemExit(f'Truncated ar header: {path}')
+            name = h[:16].decode('ascii', 'replace').strip().rstrip('/')
+            size = int(h[48:58].decode('ascii').strip())
+            data = f.read(size)
+            if size & 1:
+                f.read(1)
+            if name.startswith('data.tar'):
+                return data
+    raise SystemExit(f'No data.tar payload: {path}')
+
+found = set()
+for deb in sys.argv[2:]:
+    payload = data_payload(deb)
+    with tarfile.open(fileobj=io.BytesIO(payload), mode='r:*') as tf:
+        for m in tf.getmembers():
+            base = os.path.basename(m.name)
+            if base not in wanted or not m.isfile():
+                continue
+            src = tf.extractfile(m)
+            if src is None:
+                continue
+            dest = os.path.join(outdir, base)
+            with open(dest, 'wb') as o:
+                o.write(src.read())
+            os.chmod(dest, 0o755)
+            found.add(base)
+            print('installed', dest)
+
+missing = wanted - found
+if missing:
+    raise SystemExit('Missing runtime libraries: ' + ', '.join(sorted(missing)))
+
+links = {
+    'libatomic.so.1': 'libatomic.so.1.2.0',
+    'libstdc++.so.6': 'libstdc++.so.6.0.30',
+}
+for link, target in links.items():
+    p = os.path.join(outdir, link)
+    try:
+        os.unlink(p)
+    except FileNotFoundError:
+        pass
+    os.symlink(target, p)
+    print('linked', p, '->', target)
+PYEOF
+
+if [ $? -ne 0 ]; then
+  echo "ERROR: Runtime extraction failed."
+  exit 4
+fi
+
+echo
+echo "Runtime directory contents:"
+ls -l "$RUNTIME"
+
+echo
+echo "[3/4] Verifying Node 26.13.0"
+NODE=/usr/local/node/bin/node
+if [ ! -x "$NODE" ]; then
+  echo "Node from b5 is missing; downloading it again."
+  NODEVER=v26.13.0
+  NODEFILE="node-$NODEVER-linux-x64.tar.xz"
+  curl -fL "https://nodejs.org/dist/$NODEVER/$NODEFILE" -o "/tmp/$NODEFILE" || exit 5
+  curl -fL "https://nodejs.org/dist/$NODEVER/SHASUMS256.txt" -o /tmp/SHASUMS256.txt || exit 6
+  ( cd /tmp && grep "  $NODEFILE$" SHASUMS256.txt | sha256sum -c - ) || exit 7
+  rm -rf /usr/local/node "/usr/local/node-$NODEVER-linux-x64"
+  tar -xJf "/tmp/$NODEFILE" -C /usr/local || exit 8
+  mv "/usr/local/node-$NODEVER-linux-x64" /usr/local/node || exit 9
+fi
+
+echo "Dynamic dependencies:"
+if command -v ldd >/dev/null 2>&1; then
+  LD_LIBRARY_PATH="$RUNTIME" ldd "$NODE" || true
+fi
+
+cat > /usr/local/bin/node <<'EOF'
+#!/bin/sh
+LD_LIBRARY_PATH="/usr/local/node-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+exec /usr/local/node/bin/node "$@"
+EOF
+chmod 755 /usr/local/bin/node
+
+cat > /usr/local/bin/npm <<'EOF'
+#!/bin/sh
+PATH="/usr/local/bin:/usr/local/node/bin:$PATH"
+LD_LIBRARY_PATH="/usr/local/node-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH LD_LIBRARY_PATH
+exec /usr/local/node/bin/npm "$@"
+EOF
+chmod 755 /usr/local/bin/npm
+
+cat > /usr/local/bin/npx <<'EOF'
+#!/bin/sh
+PATH="/usr/local/bin:/usr/local/node/bin:$PATH"
+LD_LIBRARY_PATH="/usr/local/node-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH LD_LIBRARY_PATH
+exec /usr/local/node/bin/npx "$@"
+EOF
+chmod 755 /usr/local/bin/npx
+
+echo "Node:"
+node -v || exit 10
+echo "npm:"
+npm -v || exit 11
+echo "npx:"
+npx -v || exit 12
+
+echo
+echo "[4/4] Creating RDC launcher"
+cat > /usr/local/bin/rdc <<'EOF'
+#!/bin/sh
+PATH="/usr/local/bin:/usr/local/node/bin:$PATH"
+LD_LIBRARY_PATH="/usr/local/node-lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export PATH LD_LIBRARY_PATH
+exec /usr/local/bin/npx --yes @wonderwhy-er/desktop-commander@latest remote "$@"
+EOF
+chmod 755 /usr/local/bin/rdc
+
+echo
+echo "=== b6 COMPLETE ==="
+echo "Node: $(node -v)"
+echo "npm:  $(npm -v)"
+echo "npx:  $(npx -v)"
+echo "Next command: rdc"
+echo "Log: $LOG"
