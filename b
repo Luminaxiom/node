@@ -43,17 +43,25 @@ fi
 echo
 echo "[2/6] Restoring the ChromeOS binary-package host"
 
-. /etc/lsb-release
-BOARD="${CHROMEOS_RELEASE_BOARD:-}"
+get_lsb() {
+  grep -m1 "^$1=" /etc/lsb-release | cut -d= -f2- | sed 's/^"//;s/"$//'
+}
+
+BOARD="$(get_lsb CHROMEOS_RELEASE_BOARD)"
 BOARD="${BOARD%%-signed-*}"
-VER="${CHROMEOS_RELEASE_VERSION:-}"
+VER="$(get_lsb CHROMEOS_RELEASE_VERSION)"
+DEVSERVER="$(get_lsb CHROMEOS_DEVSERVER)"
 
 if [ -z "$BOARD" ] || [ -z "$VER" ]; then
   echo "ERROR: Could not determine ChromeOS board/version from /etc/lsb-release."
   exit 4
 fi
 
-BINHOST="https://commondatastorage.googleapis.com/chromeos-dev-installer/board/$BOARD/$VER/packages"
+if [ -n "$DEVSERVER" ]; then
+  BINHOST="$DEVSERVER/static/pkgroot/$BOARD/packages"
+else
+  BINHOST="https://commondatastorage.googleapis.com/chromeos-dev-installer/board/$BOARD/$VER/packages"
+fi
 CONF=/usr/local/etc/portage/make.conf
 mkdir -p /usr/local/etc/portage
 
